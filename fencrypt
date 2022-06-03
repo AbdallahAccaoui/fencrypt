@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+import argparse
+from pathlib import Path
+import sys
+import getpass
+import hashlib
+import secrets
+from Crypto.Cipher import AES
+from Crypto.Hash import HMAC, SHA256
+import json
+import regex
+import unicodedata
+
+class ErrorManagement:
+
+    inexistant_path: list
+    small_file: list
+    d_no_metadata: list
+    e_metadata: list
+    password_no_match: list
+    
+    def __init__(self) -> None:
+        self.inexistant_path = []
+        self.small_file = []
+        self.d_no_metadata = []
+        self.e_metadata = []
+        self.password_no_match = []        
+
+    def print_error(self):
+        if self.inexistant_path:
+            print(f'Invalid filepaths for the following filenames: {" ".join(self.inexistant_path)}')
+            sys.exit(1)
+        if self.small_file:
+            print(f'File size should be greater than 31 bytes for the following filenames: {" ".join(self.small_file)}')
+            sys.exit(1)
+        if self.d_no_metadata:
+            print(" ".join(self.d_no_metadata)+' are unencrypted, \nNo files were decrypted', file=sys.stderr)
+            sys.exit(1)
+        if self.e_metadata:
+            print(" ".join(self.e_metadata)+' are already encrypted, \nNo files were encrypted', file=sys.stderr)
+            sys.exit(1)
+        if self.password_no_match:
+            print(f'The password did not match for the following filenames: {" ".join(self.password_no_match)}', file=sys.stderr)
+            sys.exit(1)
+
+class ArgumentParsing:
+    
+    args: argparse.Namespace
+    error_messages: ErrorManagement
+    
+    def __init__(self) -> None:
+        parser = argparse.ArgumentParser(prog = 'fencrypt', description="File encryption, decryption and search")
+        parser.add_argument('P', nargs='+', help='File paths or search terms')
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument('-e', action='store_true', help='File name to encrypt', required=False)
+        group.add_argument('-d', action='store_true', help='File name to decrypt', required=False)
+        group.add_argument('-s', action='store_true', help='terms to search in the files', required=False) 
+        parser.add_argument('-j', action='store_true', help='output JSON to stdout', required=False)
+        self.args = parser.parse_args()
+
+        self.error_messages = ErrorManagement()
+        self.verify_args()
+        self.error_messages.print_error()
+        
+
+    def verify_args(self):
+        if not self.args.s:
+            for fname in self.args.P:
+                path = Path(fname)
+                if not path.exists() or not path.is_file():
+                    self.error_messages.inexistant_path.append(fname)
+                elif path.stat().st_size < 32:
+                    self.error_messages.small_file.append(fname)
+                
+                p_metaname = Path('.fenc-meta.'+fname)
+                if self.args.d and (not p_metaname.exists() or not p_metaname.is_file()):
+                    self.error_messages.d_no_metadata.append(fname)
+                if not self.args.d and p_metaname.exists() and p_metaname.is_file():
+                    self.error_messages.e_metadata.append(fname)
+   
+class HelpCrypt:
+        
+    @staticmethod
+    def generate_salt():
+        return secrets.token_bytes(16)
+
+    @staticmethod
+    def generate_master_key(password_in, salt):
+        return hashlib.pbkdf2_hmac('sha256', bytes(password_in, encoding='utf-8'), salt, 250_000)
+
+    @staticmethod
+    def key_schedule(master_key):
+        ctx =  AES.new(master_key[:16], mode=AES.MODE_CTR, nonce=master_key[16:24], initial_value=master_key[24:])
+        data = b'\x00' * 16 * 7
+        keys = ctx.encrypt(data)
+        return [keys[i:i+16] for i in range(0, len(keys), 16)]
+
+    @staticmethod
+    def feistel_enc_dec_odd_round(block, roundkey):
+        lin = block[:16]
+        rin = block[16:]
+        ctx = AES.new(roundkey, mode=AES.MODE_CTR, nonce=lin[:8], initial_value=lin[8:])
+        rout = ctx.encrypt(rin)
+        lout = lin
+        return lout+rout
+
+    @staticmethod
+    def feistel_enc_dec_even_round(block, roundkey):
+        lin = block[:16]
+        rin = block[16:]
+        ctx = HMAC.new(roundkey, digestmod=SHA256, msg=rin)
+        mac_output = ctx.digest()
+        lout = bytes([mac_output[:16][i] ^ lin[i] for i in range(len(lin))])
+        rout = rin
+        return lout+rout
+
+    @staticmethod
+    def feistel_encryption(k1, k2, k3, k4, file):
+        r1 = HelpCrypt.feistel_enc_dec_odd_round(file, k1)
+        r2 = HelpCrypt.feistel_enc_dec_even_round(r1, k2)
+        r3 = HelpCrypt.feistel_enc_dec_odd_round(r2, k3)
+        return HelpCrypt.feistel_enc_dec_even_round(r3, k4)
+    
+    @staticmethod
+    def feistel_decryption(k1, k2, k3, k4, file):
+        r1 = HelpCrypt.feistel_enc_dec_even_round(file, k4)
+        r2 = HelpCrypt.feistel_enc_dec_odd_round(r1, k3)
+        r3 = HelpCrypt.feistel_enc_dec_even_round(r2, k2)
+        return HelpCrypt.feistel_enc_dec_odd_round(r3, k1)
+
+    @staticmethod
+    def mac_ciphertext(key, ct):
+        ctx = HMAC.new(key, digestmod=SHA256, msg=ct)
+        mac_output = ctx.digest()
+        return mac_output
+
+class ProcessFile:
+    
+    salt: bytes
+    kd: bytes
+    password_validator: bytes
+    filename: str
+    meta: object
+    
+    def __init__(self, filename, password_in, purpose):
+        self.filename = filename
+        self.password_in = password_in
+        self.meta = {}
+        if purpose == 'E':
+            self.salt = HelpCrypt.generate_salt()
+            self.kd = HelpCrypt.generate_master_key(self.password_in, self.salt)
+        elif purpose == 'D':
+            p = Path('.fenc-meta.'+filename)
+            self.meta = json.loads(p.read_text())
+            self.salt = bytes.fromhex(self.meta['salt'])
+            self.kd = HelpCrypt.generate_master_key(self.password_in, self.salt)
+        elif purpose == 'S':
+            p = Path(filename)
+            self.meta = json.loads(p.read_text())
+            self.salt = bytes.fromhex(self.meta['salt'])
+            self.kd = HelpCrypt.generate_master_key(self.password_in, self.salt)
+        
+    def search(self, search_term):
+        self.password_validator, k1, k2, k3, k4, k5, k6 = HelpCrypt.key_schedule(self.kd)
+        search_term_normalized = WordProcessing.case_fold_normalize(search_term)
+        mac_search_term = HelpCrypt.mac_ciphertext(k6, search_term_normalized.encode('utf-8'))
+        if mac_search_term.hex() in self.meta['terms']:
+            print(self.filename[11:])
+        
+
+    def encrypt(self):
+        self.password_validator, k1, k2, k3, k4, k5, k6 = HelpCrypt.key_schedule(self.kd)
+        p = Path(self.filename)
+        try:
+            self.meta['terms'] = [x.hex() for x in WordProcessing.mac_search_terms(k6, p.read_bytes().decode('utf-8'))]
+        except UnicodeDecodeError:
+            self.meta['terms'] = []
+        
+        ct = HelpCrypt.feistel_encryption(k1, k2, k3, k4, p.read_bytes())
+        p.write_bytes(ct)
+        mac_ct = HelpCrypt.mac_ciphertext(k5, ct)
+        self.meta['salt'] = self.salt.hex()
+        self.meta['validator'] = self.password_validator.hex()
+        self.meta['mac'] = mac_ct.hex()
+        
+        p_meta = Path('.fenc-meta.'+self.filename)
+        p_meta.write_text(json.dumps(self.meta))
+        #f_write = p_write.open('w')
+        #json.dump(self.meta, fp = f_write)
+        #f_write.close()
+        #enc_data = HelpCrypt.feistel_encryption(k1, k2, k3, k4, self.arg)
+        #mac_ciphertext = HelpCrypt.mac_ciphertext(k5, enc_data)
+    
+    #check first
+    def is_password_match(self, password_validator):
+        if password_validator.hex() != self.meta['validator']:
+            return False
+        return True
+
+    def decrypt(self):
+        self.password_validator, k1, k2, k3, k4, k5, k6 = HelpCrypt.key_schedule(self.kd)
+        p = Path(self.filename)
+        mac_ct = HelpCrypt.mac_ciphertext(k5, p.read_bytes())
+        if mac_ct.hex() != self.meta['mac']:
+            print(f'{self.filename} has been tampered with and has not been decrypted')
+            return
+        pt = HelpCrypt.feistel_decryption(k1, k2, k3, k4, p.read_bytes())
+        p.write_bytes(pt)
+        p_meta = Path('.fenc-meta.'+self.filename)
+        p_meta.unlink()
+
+class ProcessManagement:
+
+    args: argparse.Namespace
+    process_files: list
+    filenames_master_key: dict
+    filenames_allkeys: dict
+    error_messages: ErrorManagement
+
+    def search(self, password_in):
+        p = Path.cwd()
+        metadata_files = []
+        for l in p.iterdir():
+            if l.is_file() and '.fenc-meta' in str(l):
+                metadata_files.append(l)
+        
+        if not metadata_files:
+            print('No files were present', file=sys.stderr)
+            sys.exit(1)
+
+        
+        for meta_path in metadata_files:
+            filename = meta_path.name
+            process_file = ProcessFile(filename, password_in, 'S')
+            password_validator, k1, k2, k3, k4, k5, k6 = HelpCrypt.key_schedule(process_file.kd)
+            if not process_file.is_password_match(password_validator):
+                print(f'{process_file.filename[11:]} does not match with the password.', file=sys.stderr)
+            else:    
+                self.filenames_master_key[filename[11:]] = process_file.kd.hex()
+                self.process_files.append(process_file)
+        
+        if not self.process_files:
+            print('No file matched the password', file=sys.stderr)
+            sys.exit(1)
+
+        if self.args.j:
+            print(json.dumps(self.filenames_master_key, indent=" "))
+
+        for search_arg in self.args.P:
+            for process in self.process_files:
+                process.search(search_arg)
+
+
+    def __init__(self, args, password_in) -> None:
+        self.process_files = []
+        self.args = args
+        self.filenames_master_key = dict()
+        self.filenames_allkeys = dict()
+        self.error_messages = ErrorManagement()
+
+        if not self.args.s:
+            for fname in self.args.P:
+                process_file = ProcessFile(fname, password_in, 'D' if self.args.d else 'E')
+                self.process_files.append(process_file)
+                self.filenames_master_key[fname] = process_file.kd.hex()
+                password_validator, k1, k2, k3, k4, k5, k6 = HelpCrypt.key_schedule(process_file.kd)
+                self.filenames_allkeys[fname] = {
+                    'password validator' : password_validator.hex(),
+                    '1st round key' : k1.hex(),
+                    '2nd round key' : k2.hex(),
+                    '3rd round key' : k3.hex(),
+                    '4th round key' : k4.hex(),
+                    'mac key' : k5.hex(),
+                    'search term key' : k6.hex()
+                    }
+                if self.args.d and not process_file.is_password_match(password_validator):
+                    self.error_messages.password_no_match.append(fname)
+
+            if self.args.j:
+                print(json.dumps(self.filenames_master_key, indent=" "))
+            
+            if self.args.j and self.args.d:
+                print(json.dumps(self.filenames_allkeys, indent=" "))
+            
+            self.error_messages.print_error()
+            
+            if not self.args.d:
+                for proc in self.process_files:
+                    proc.encrypt()
+            elif self.args.d:
+                for proc in self.process_files:
+                    proc.decrypt()
+        elif self.args.s:
+            self.search(password_in)
+
+
+class WordProcessing:
+    
+    @staticmethod
+    def extractWords(string):
+        pattern = '[\p{L}\p{Mn}\p{Nd}\p{Pc}]+'
+        extracted_words = regex.findall(pattern, string)
+        return sorted([x for x in extracted_words if 4 <= len(x) <= 12])
+    
+    @staticmethod
+    def case_fold_normalize(s):
+        return unicodedata.normalize('NFC',s.casefold().lower())
+    
+    @staticmethod
+    def generate_star(word):
+        star_words = []
+        for i in range(3,len(word)-1):
+            star_word = word[0:i+1] + '*'
+            star_words.append(star_word)
+        star_words.append(word)
+        return star_words
+    
+    @staticmethod
+    def generate_search_terms(string):
+        search_terms = []
+        extracted_words = WordProcessing.extractWords(string)
+        for x in extracted_words:
+            search_terms = search_terms + WordProcessing.generate_star(x)
+        return [WordProcessing.case_fold_normalize(x) for x in search_terms]
+    
+    @staticmethod
+    def mac_search_terms(key, string):
+        generated_search_terms = WordProcessing.generate_search_terms(string)
+        generated_search_terms = sorted(list(set(generated_search_terms)))
+        macced_search_terms = []
+        for x in generated_search_terms:
+            mac = HelpCrypt.mac_ciphertext(key, x.encode('utf-8'))
+            macced_search_terms.append(mac)
+        return macced_search_terms
+
+
+class ProjectComponents:
+
+    input_object: object
+    output_object: object
+    
+    def __init__(self) -> None:
+        self.input_object = json.load(sys.stdin)
+        self.output_object = {}
+
+    
+    def problem_1(self, password, salt):
+        salt_in = bytes.fromhex(salt)
+        master_key = HelpCrypt.generate_master_key(password, salt_in)
+        self.output_object["problem 1"] = master_key.hex()
+    
+    def problem_2(self, master_key):
+        master_key_in = bytes.fromhex(master_key)
+        validator, k1, k2, k3, k4, k5, k6 = HelpCrypt.key_schedule(master_key_in)
+        self.output_object["problem 2"] = {
+            "validator": validator.hex(),
+            "feistel": [
+                k1.hex(),
+                k2.hex(),
+                k3.hex(),
+                k4.hex()
+            ],
+            "mac": k5.hex(),
+            "search_terms": k6.hex()
+        }
+
+    def problem_3(self, key, data):
+        key_in = bytes.fromhex(key)
+        data_in = bytes.fromhex(data)
+        data_out = HelpCrypt.feistel_enc_dec_odd_round(data_in, key_in)
+        self.output_object["problem 3"] = data_out.hex()
+
+    def problem_4(self, key, data):
+        key_in = bytes.fromhex(key)
+        data_in = bytes.fromhex(data)
+        data_out = HelpCrypt.feistel_enc_dec_even_round(data_in, key_in)
+        self.output_object["problem 4"] = data_out.hex()
+    
+    def problem_5(self, k1, k2, k3, k4, plaintext):
+        pt_in = bytes.fromhex(plaintext)
+        ct = HelpCrypt.feistel_encryption(bytes.fromhex(k1), \
+            bytes.fromhex(k2), bytes.fromhex(k3), bytes.fromhex(k4), pt_in)
+        self.output_object["problem 5"] = ct.hex()
+
+    def problem_6(self, k1, k2, k3, k4, ciphertext):
+        ct_in = bytes.fromhex(ciphertext)
+        pt = HelpCrypt.feistel_decryption(bytes.fromhex(k1), \
+            bytes.fromhex(k2), bytes.fromhex(k3), bytes.fromhex(k4), ct_in)
+        self.output_object["problem 6"] = pt.hex()
+    
+    def problem_7(self, key, data):
+        key_in = bytes.fromhex(key)
+        data_in = bytes.fromhex(data)
+        mac = HelpCrypt.mac_ciphertext(key_in, data_in)
+        self.output_object["problem 7"] = mac.hex()
+    
+    def problem_8(self, data):
+        self.output_object["problem 8"] = WordProcessing.extractWords(data)
+
+    def problem_9(self, data):
+        self.output_object["problem 9"] = WordProcessing.extractWords(data)
+
+    def problem_10(self, data):
+        self.output_object["problem 10"] = WordProcessing.generate_search_terms(data)
+
+    def problem_11(self, data):
+        self.output_object["problem 11"] = WordProcessing.generate_search_terms(data)
+
+    def run(self):
+        
+        self.problem_1(self.input_object["problem 1"]["password"],\
+             self.input_object["problem 1"]["salt"])
+        self.problem_2(self.input_object["problem 2"])
+        self.problem_3(self.input_object["problem 3"]["key"],\
+            self.input_object["problem 3"]["data"])
+        self.problem_4(self.input_object["problem 4"]["key"],\
+            self.input_object["problem 4"]["data"])
+        
+        enc_feistel_keys = self.input_object["problem 5"]["keys"]
+        self.problem_5(enc_feistel_keys[0],enc_feistel_keys[1],\
+            enc_feistel_keys[2], enc_feistel_keys[3],\
+                 self.input_object["problem 5"]["plaintext"] )
+        
+        dec_feistel_keys = self.input_object["problem 6"]["keys"]
+        self.problem_6(dec_feistel_keys[0],dec_feistel_keys[1],\
+            dec_feistel_keys[2], dec_feistel_keys[3],\
+                 self.input_object["problem 6"]["ciphertext"] )
+        
+        self.problem_7(self.input_object["problem 7"]["key"],\
+            self.input_object["problem 7"]["data"])
+        
+        self.problem_8(self.input_object["problem 8"])
+        self.problem_9(self.input_object["problem 9"])
+        self.problem_10(self.input_object["problem 10"])
+        self.problem_11(self.input_object["problem 11"])
+        
+        #json.dump(self.output_object, sys.stdout)
+        print(json.dumps(self.output_object, indent=" "))
+        
+
+
+if __name__ == "__main__":
+    
+    arg_parse = ArgumentParsing()
+    if sys.stdin.isatty():
+        password_in = getpass.getpass("password: ")
+    else:
+        password_in = sys.stdin.readline().strip()
+    
+    if password_in == '':
+        sys.exit(1)
+    #password_in = getpass.getpass()
+    p = ProcessManagement(arg_parse.args, password_in)
+
+    #pc = ProjectComponents()
+    #pc.run()
+
+
+    
+
+
