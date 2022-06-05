@@ -5,7 +5,7 @@
 It uses: 
 1) a password-based key derivation function to generate a "master" key.
 2) a simpler KDF scheme to generate a series of keys for further operations.
-3) a two different PRFs to implement a four-round feistel cipher that you will use for encryption and decryption.
+3) a two different PRFs to implement a four-round feistel cipher that are used for encryption and decryption.
 4) an HMAC-SHA2-256 in order to detect attempts to tamper with files.
 5) an HMAC-SHA2-256 in order to support encrypted search terms.
 
